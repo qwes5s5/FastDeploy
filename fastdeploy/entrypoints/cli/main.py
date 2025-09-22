@@ -21,11 +21,15 @@ import importlib.metadata
 
 
 def main():
+    import fastdeploy.entrypoints.cli.benchmark.main
+    import fastdeploy.entrypoints.cli.collect_env
     import fastdeploy.entrypoints.cli.openai
     from fastdeploy.utils import FlexibleArgumentParser
 
     CMD_MODULES = [
         fastdeploy.entrypoints.cli.openai,
+        fastdeploy.entrypoints.cli.collect_env,
+        fastdeploy.entrypoints.cli.benchmark.main,
     ]
 
     parser = FlexibleArgumentParser(description="FastDeploy CLI")
@@ -33,7 +37,7 @@ def main():
         "-v",
         "--version",
         action="version",
-        version=importlib.metadata.version("fastdeploy"),
+        version=importlib.metadata.version("fastdeploy-gpu"),
     )
     subparsers = parser.add_subparsers(required=False, dest="subparser")
     cmds = {}

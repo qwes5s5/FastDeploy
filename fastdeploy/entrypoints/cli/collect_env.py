@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-# This file is modified from https://github.com/vllm-project/vllm/entrypoints/cli/collect_env.py
+# This file is modified from https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/cli/collect_env.py
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class CollectEnvSubcommand(CLISubcommand):
             "collect-env",
             help="Start collecting environment information.",
             description="Start collecting environment information.",
-            usage="vllm collect-env",
+            usage="FastDeploy collect-env",
         )
 
 
