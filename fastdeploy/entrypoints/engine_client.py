@@ -321,6 +321,12 @@ class EngineClient:
         elif logprobs:
             raise ParameterError("logprobs", "Invalid type for 'logprobs'")
 
+        if data.get("prompt_logprobs", None) is not None:
+            if not self.enable_logprob:
+                err_msg = "Logprobs is disabled, please enable it in startup config."
+                api_server_logger.error(err_msg)
+                raise ParameterError("logprobs", err_msg)
+
         # enable_logprob
         if top_logprobs:
             if not self.enable_logprob:

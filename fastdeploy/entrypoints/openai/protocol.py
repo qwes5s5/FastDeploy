@@ -24,6 +24,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from fastdeploy.engine.pooling_params import PoolingParams
+from fastdeploy.worker.output import PromptLogprobs
 
 
 class InvalidParameterException(Exception):
@@ -217,6 +218,7 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[LogProbs] = None
+    prompt_logprobs: Optional[PromptLogprobs] = None
     draft_logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "tool_calls", "recover_stop"]]
 
@@ -278,6 +280,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: Optional[LogProbs] = None
+    prompt_logprobs: Optional[PromptLogprobs] = None
     draft_logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
     arrival_time: Optional[float] = None
@@ -310,6 +313,7 @@ class CompletionResponseChoice(BaseModel):
     arrival_time: Optional[float] = None
     logprobs: Optional[CompletionLogprobs] = None
     draft_logprobs: Optional[CompletionLogprobs] = None
+    prompt_logprobs: Optional[PromptLogprobs] = None
     reasoning_content: Optional[str] = None
     finish_reason: Optional[Literal["stop", "length", "tool_calls"]]
     tool_calls: Optional[List[DeltaToolCall | ToolCall]] = None
@@ -349,6 +353,7 @@ class CompletionResponseStreamChoice(BaseModel):
     arrival_time: float = None
     logprobs: Optional[CompletionLogprobs] = None
     draft_logprobs: Optional[CompletionLogprobs] = None
+    prompt_logprobs: Optional[PromptLogprobs] = None
     prompt_token_ids: Optional[List[int]] = None
     completion_token_ids: Optional[List[int]] = None
     prompt_tokens: Optional[str] = None
@@ -436,6 +441,7 @@ class CompletionRequest(BaseModel):
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
     logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
     include_draft_logprobs: Optional[bool] = False
     # For logits and logprobs post processing
     temp_scaled_logprobs: bool = False
@@ -569,6 +575,14 @@ class CompletionRequest(BaseModel):
 
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def check_logprobs(cls, data):
+        if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
+            if prompt_logprobs < -1:
+                raise ValueError("`top_logprobs` must be a greater than -1.")
+        return data
+
 
 class ChatCompletionRequest(BaseModel):
     """
@@ -583,6 +597,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = Field(None, le=2, ge=-2)
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
+    prompt_logprobs: Optional[int] = None
     include_draft_logprobs: Optional[bool] = False
 
     # For logits and logprobs post processing
@@ -651,6 +666,7 @@ class ChatCompletionRequest(BaseModel):
 
         req_dict["max_tokens"] = self.max_completion_tokens or self.max_tokens
         req_dict["logprobs"] = self.top_logprobs if self.logprobs else None
+        req_dict["prompt_logprobs"] = self.prompt_logprobs
         req_dict["temp_scaled_logprobs"] = self.temp_scaled_logprobs
         req_dict["top_p_normalized_logprobs"] = self.top_p_normalized_logprobs
 
@@ -759,7 +775,9 @@ class ChatCompletionRequest(BaseModel):
 
             if top_logprobs > 0 and not data.get("logprobs"):
                 raise ValueError("when using `top_logprobs`, `logprobs` must be set to true.")
-
+        if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
+            if prompt_logprobs < -1:
+                raise ValueError("`top_logprobs` must be a greater than -1.")
         return data
 
 

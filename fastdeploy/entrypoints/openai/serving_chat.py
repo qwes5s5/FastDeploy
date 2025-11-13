@@ -15,9 +15,11 @@
 """
 
 import asyncio
+import itertools
 import time
 import traceback
 import uuid
+from collections.abc import Iterable
 from typing import List, Optional
 
 import numpy as np
@@ -47,7 +49,9 @@ from fastdeploy.utils import (
     api_server_logger,
     get_host_ip,
 )
-from fastdeploy.worker.output import LogprobsLists
+from fastdeploy.worker.output import Logprob, LogprobsLists, PromptLogprobs
+
+NONES = itertools.repeat(None)
 
 
 class OpenAIServingChat:
@@ -282,6 +286,12 @@ class OpenAIServingChat:
                         num_input_image_tokens = res.get("num_input_image_tokens", 0)
                         num_input_video_tokens = res.get("num_input_video_tokens", 0)
                         for i in range(num_choices):
+                            prompt_logprobs_res: Optional[PromptLogprobs] = None
+                            prompt_logprobs_tensors = res.get("prompt_logprobs_tensors", None)
+                            if request.prompt_logprobs and prompt_logprobs_tensors is not None:
+                                prompt_logprobs_res = self._build_prompt_logprobs(
+                                    prompt_logprobs_tensors, request.prompt_logprobs
+                                )
                             choice = ChatCompletionResponseStreamChoice(
                                 index=i,
                                 delta=DeltaMessage(
@@ -291,6 +301,7 @@ class OpenAIServingChat:
                                     prompt_token_ids=None,
                                     completion_token_ids=None,
                                 ),
+                                prompt_logprobs=prompt_logprobs_res,
                             )
                             if response_processor.enable_multimodal_content():
                                 choice.delta.multimodal_content = [
@@ -491,6 +502,7 @@ class OpenAIServingChat:
                 enable_mm_output=self.enable_mm_output,
                 decoder_base_url=self.tokenizer_base_url,
             )
+            prompt_logprobs_res_list = [[] for _ in range(num_choices)]
             choices = []
             while num_choices > 0:
                 if self.engine_client.check_model_weight_status():
@@ -547,7 +559,13 @@ class OpenAIServingChat:
                             )
                             if draft_logprobs_res and draft_logprobs_res.content is not None:
                                 draft_logprob_contents[idx].extend(draft_logprobs_res.content)
-
+                    prompt_logprobs_tensors = data.get("prompt_logprobs_tensors", None)
+                    if request.prompt_logprobs and prompt_logprobs_tensors is not None:
+                        prompt_logprobs_res = self._build_prompt_logprobs(
+                            prompt_logprobs_tensors, request.prompt_logprobs
+                        )
+                        if prompt_logprobs_res:
+                            prompt_logprobs_res_list[idx].extend(prompt_logprobs_res)
                     if data["finished"]:
                         num_choices -= 1
                         reasoning_num_tokens[idx] = data["outputs"].get("reasoning_token_num", 0)
@@ -566,6 +584,7 @@ class OpenAIServingChat:
                             num_input_video_tokens=num_input_video_tokens,
                             num_image_tokens=num_image_tokens,
                             logprob_contents=logprob_contents,
+                            prompt_logprobs_res_list=prompt_logprobs_res_list,
                             response_processor=response_processor,
                         )
                         choices.append(choice)
@@ -615,6 +634,7 @@ class OpenAIServingChat:
         num_input_video_tokens: list,
         num_image_tokens: list,
         logprob_contents: list,
+        prompt_logprobs_res_list: list,
         response_processor: ChatResponseProcessor,
     ) -> ChatCompletionResponseChoice:
         idx = int(data["request_id"].split("_")[-1])
@@ -641,6 +661,8 @@ class OpenAIServingChat:
         logprobs_full_res = None
         if logprob_contents[idx]:
             logprobs_full_res = LogProbs(content=logprob_contents[idx])
+        if prompt_logprobs_res_list[idx]:
+            prompt_logprobs_full_res = prompt_logprobs_res_list[idx]
 
         has_no_token_limit = request.max_tokens is None and request.max_completion_tokens is None
         max_tokens = request.max_completion_tokens or request.max_tokens
@@ -663,6 +685,7 @@ class OpenAIServingChat:
             index=idx,
             message=message,
             logprobs=logprobs_full_res,
+            prompt_logprobs=prompt_logprobs_full_res,
             finish_reason=finish_reason,
         )
 
@@ -768,3 +791,85 @@ class OpenAIServingChat:
                 else:
                     enable_thinking = True
         return enable_thinking
+
+    def _build_prompt_logprobs(
+        self,
+        prompt_logprobs_tensors: list,
+        num_prompt_logprobs: int,
+    ):
+        """Update with prompt logprobs from worker.
+        Args:
+          prompt_logprobs_tensors: tuple containing the prompt logprobs
+                                   tensors.
+        """
+
+        token_ids, logprobs, ranks = prompt_logprobs_tensors
+
+        # Detokenize non-incrementally.
+        # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]
+        decoded_tokens = [
+            self.engine_client.data_processor.process_logprob_response(token_id)
+            for token_id in itertools.chain.from_iterable(token_ids)
+        ]
+
+        # Recover shapes.
+        num_prompt_tokens = len(logprobs)
+        num_logprobs = len(logprobs[0]) if logprobs else 0
+
+        prompt_token_ranks = ranks
+        prompt_logprobs = logprobs
+        result = []
+
+        for pos in range(num_prompt_tokens):
+            # Handle flattening.
+            offset = pos * num_logprobs
+            offset_end = offset + num_logprobs
+            decoded_tokens_for_pos = decoded_tokens[offset:offset_end]
+
+            # Update with the Logprob dictionary for this pos.
+            result.append(
+                self._make_logprob_dict(
+                    prompt_logprobs[pos],
+                    token_ids[pos],
+                    decoded_tokens_for_pos,
+                    prompt_token_ranks[pos],
+                    num_prompt_logprobs,
+                )
+            )
+        return result
+
+    @staticmethod
+    def _make_logprob_dict(
+        logprobs: list[float],
+        logprob_token_ids: list[int],
+        decoded_tokens: Iterable[str | None],
+        rank: int,
+        num_logprobs: int,
+    ) -> dict[int, Logprob]:
+        """Make a Logprob dictionary for a position.
+        Args:
+          logprobs: list of log probabilities
+          logprob_token_ids: list of top token ids
+          decoded_tokens: list of decoded top tokens
+          rank: rank of the sampled token
+          num_logprobs: number of logprobs requested
+            by the user (in addition to sampled logprob)
+        Returns:
+          dict[token id, Logprob]
+        """
+        if num_logprobs == -1:
+            num_logprobs = len(logprobs)
+        # We do not need a special case for the sampled token
+        # being in the topk, since inserting duplicated data
+        # into a dictionary twice is the same as doing it once.
+        topk_ranks = range(1, num_logprobs + 1)
+        ranks = itertools.chain((rank,), topk_ranks)
+
+        return {
+            token_id: Logprob(
+                logprob=logprob,
+                rank=rank,
+                decoded_token=token,
+            )
+            for token_id, logprob, rank, token in zip(logprob_token_ids, logprobs, ranks, decoded_tokens)
+        }

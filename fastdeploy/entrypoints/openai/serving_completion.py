@@ -15,9 +15,11 @@
 """
 
 import asyncio
+import itertools
 import time
 import traceback
 import uuid
+from collections.abc import Iterable
 from typing import List, Optional
 
 import numpy as np
@@ -43,7 +45,9 @@ from fastdeploy.utils import (
     api_server_logger,
     get_host_ip,
 )
-from fastdeploy.worker.output import LogprobsLists
+from fastdeploy.worker.output import Logprob, LogprobsLists, PromptLogprobs
+
+NONES = itertools.repeat(None)
 
 
 class OpenAIServingCompletion:
@@ -242,6 +246,7 @@ class OpenAIServingCompletion:
             aggregated_top_logprobs = [[[], [], []] for _ in range(num_choices)]
             aggregated_draft_top_logprobs = [[[], [], []] for _ in range(num_choices)]
             aggregated_token_ids = [[] for _ in range(num_choices)]
+            aggregated_prompt_logprobs_tensors = [[[], [], []] for _ in range(num_choices)]
             completion_batched_token_ids = [[] for _ in range(num_choices)]
             current_waiting_time = 0
             while num_choices > 0:
@@ -286,6 +291,12 @@ class OpenAIServingCompletion:
                             aggregated_draft_top_logprobs[rid][1].extend(output_draft_top_logprobs[1])
                             aggregated_draft_top_logprobs[rid][2].extend(output_draft_top_logprobs[2])
 
+                    output_prompt_logprobs_tensors = data.get("prompt_logprobs_tensors") or None
+                    if output_prompt_logprobs_tensors is not None:
+                        aggregated_prompt_logprobs_tensors[rid][0].extend(output_prompt_logprobs_tensors[0])
+                        aggregated_prompt_logprobs_tensors[rid][1].extend(output_prompt_logprobs_tensors[1])
+                        aggregated_prompt_logprobs_tensors[rid][2].extend(output_prompt_logprobs_tensors[2])
+
                     aggregated_token_ids[rid].extend(data["outputs"]["token_ids"])
 
                     self.engine_client.data_processor.process_response_dict(
@@ -298,6 +309,7 @@ class OpenAIServingCompletion:
                         data["outputs"]["top_logprobs"] = aggregated_top_logprobs[rid]
                         data["outputs"]["draft_top_logprobs"] = aggregated_draft_top_logprobs[rid]
                         data["outputs"]["token_ids"] = aggregated_token_ids[rid]
+                        data["prompt_logprobs_tensors"] = aggregated_prompt_logprobs_tensors[rid]
                         valid_results[rid] = data
                         num_choices -= 1
                         break
@@ -416,8 +428,13 @@ class OpenAIServingCompletion:
                     idx = int(res["request_id"].split("_")[-1])
                     if res.get("error_code", 200) != 200:
                         raise ValueError("{}".format(res["error_msg"]))
-
+                    prompt_logprobs_res: Optional[PromptLogprobs] = None
                     if first_iteration[idx]:
+                        prompt_logprobs_tensors = res.get("prompt_logprobs_tensors", None)
+                        if request.prompt_logprobs and prompt_logprobs_tensors is not None:
+                            prompt_logprobs_res = self._build_prompt_logprobs(
+                                prompt_logprobs_tensors, request.prompt_logprobs
+                            )
                         if request.return_token_ids:
                             chunk = CompletionStreamResponse(
                                 id=request_id,
@@ -430,6 +447,7 @@ class OpenAIServingCompletion:
                                         prompt_token_ids=list(
                                             prompt_batched_token_ids[idx // (1 if request.n is None else request.n)]
                                         ),
+                                        prompt_logprobs=prompt_logprobs_res,
                                         prompt_tokens=prompt_tokens_list[
                                             idx // (1 if request.n is None else request.n)
                                         ],
@@ -482,6 +500,7 @@ class OpenAIServingCompletion:
                         reasoning_content="",
                         arrival_time=arrival_time,
                         logprobs=logprobs_res,
+                        prompt_logprobs=prompt_logprobs_res,
                         draft_logprobs=draft_logprobs_res,
                     )
                     if not res["finished"] and "delta_message" in output:
@@ -595,7 +614,10 @@ class OpenAIServingCompletion:
                 aggregated_draft_logprobs = self._create_completion_logprobs(
                     output_draft_top_logprobs, request.logprobs, 0
                 )
-
+            prompt_logprobs_res: Optional[PromptLogprobs] = None
+            prompt_logprobs_tensors = final_res.get("prompt_logprobs_tensors", None)
+            if request.prompt_logprobs and prompt_logprobs_tensors is not None:
+                prompt_logprobs_res = self._build_prompt_logprobs(prompt_logprobs_tensors, request.prompt_logprobs)
             if request.echo:
                 prompt_text = self._echo_back_prompt(request, idx // (1 if request.n is None else request.n))
                 token_ids = [*prompt_token_ids, *output["token_ids"]]
@@ -621,6 +643,7 @@ class OpenAIServingCompletion:
                 tool_calls=output.get("tool_call"),
                 logprobs=aggregated_logprobs,
                 draft_logprobs=aggregated_draft_logprobs,
+                prompt_logprobs=prompt_logprobs_res,
                 finish_reason=finish_reason,
             )
             choices.append(choice_data)
@@ -750,3 +773,85 @@ class OpenAIServingCompletion:
         except Exception as e:
             api_server_logger.error(f"Error in _build_logprobs_response: {str(e)}, {str(traceback.format_exc())}")
             return None
+
+    def _build_prompt_logprobs(
+        self,
+        prompt_logprobs_tensors: list,
+        num_prompt_logprobs: int,
+    ):
+        """Update with prompt logprobs from worker.
+        Args:
+          prompt_logprobs_tensors: tuple containing the prompt logprobs
+                                   tensors.
+        """
+
+        token_ids, logprobs, ranks = prompt_logprobs_tensors
+
+        # Detokenize non-incrementally.
+        # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]
+        decoded_tokens = [
+            self.engine_client.data_processor.process_logprob_response(token_id)
+            for token_id in itertools.chain.from_iterable(token_ids)
+        ]
+
+        # Recover shapes.
+        num_prompt_tokens = len(logprobs)
+        num_logprobs = len(logprobs[0]) if logprobs else 0
+
+        prompt_token_ranks = ranks
+        prompt_logprobs = logprobs
+        result = []
+
+        for pos in range(num_prompt_tokens):
+            # Handle flattening.
+            offset = pos * num_logprobs
+            offset_end = offset + num_logprobs
+            decoded_tokens_for_pos = decoded_tokens[offset:offset_end]
+
+            # Update with the Logprob dictionary for this pos.
+            result.append(
+                self._make_logprob_dict(
+                    prompt_logprobs[pos],
+                    token_ids[pos],
+                    decoded_tokens_for_pos,
+                    prompt_token_ranks[pos],
+                    num_prompt_logprobs,
+                )
+            )
+        return result
+
+    @staticmethod
+    def _make_logprob_dict(
+        logprobs: list[float],
+        logprob_token_ids: list[int],
+        decoded_tokens: Iterable[str | None],
+        rank: int,
+        num_logprobs: int,
+    ) -> dict[int, Logprob]:
+        """Make a Logprob dictionary for a position.
+        Args:
+          logprobs: list of log probabilities
+          logprob_token_ids: list of top token ids
+          decoded_tokens: list of decoded top tokens
+          rank: rank of the sampled token
+          num_logprobs: number of logprobs requested
+            by the user (in addition to sampled logprob)
+        Returns:
+          dict[token id, Logprob]
+        """
+        if num_logprobs == -1:
+            num_logprobs = len(logprobs)
+        # We do not need a special case for the sampled token
+        # being in the topk, since inserting duplicated data
+        # into a dictionary twice is the same as doing it once.
+        topk_ranks = range(1, num_logprobs + 1)
+        ranks = itertools.chain((rank,), topk_ranks)
+
+        return {
+            token_id: Logprob(
+                logprob=logprob,
+                rank=rank,
+                decoded_token=token,
+            )
+            for token_id, logprob, rank, token in zip(logprob_token_ids, logprobs, ranks, decoded_tokens)
+        }
